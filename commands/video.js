@@ -4,6 +4,8 @@ import path from "path";
 import axios from "axios";
 import { spawn } from "child_process";
 import { checkLimitOrPremium } from "./premium.js";
+import { queueYouTubeDownload, retryTransient } from "./youtubeDownloadQueue.js";
+import { withYtDlpCookies } from "./ytDlpCookies.js";
 
 const MAX_VIDEO_SIZE = 95 * 1024 * 1024;
 
@@ -36,19 +38,22 @@ async function downloadStreamToFile(url, filePath) {
 }
 
 async function downloadWithYtDlp(url, filePath) {
-  await new Promise((resolve, reject) => {
-    const ytdlp = spawn("yt-dlp", [
+  const args = [
       "-f", "best[height<=480][ext=mp4]/best[height<=480]/best[ext=mp4]/best",
       "--merge-output-format", "mp4",
+      "--remux-video", "mp4",
       "--no-playlist",
+      "--js-runtimes", "node",
       "--quiet",
       "--no-warnings",
       "--socket-timeout", "30",
       "--retries", "3",
       "-o", filePath,
       url
-    ]);
+  ];
 
+  await withYtDlpCookies(args, () => new Promise((resolve, reject) => {
+    const ytdlp = spawn("yt-dlp", args);
     let stderr = "";
     ytdlp.stderr.on("data", (data) => {
       stderr += data.toString();
@@ -58,7 +63,7 @@ async function downloadWithYtDlp(url, filePath) {
       if (code === 0 && fs.existsSync(filePath)) return resolve();
       reject(new Error(`yt-dlp failed (${code}): ${stderr}`));
     });
-  });
+  }));
 }
 
 export async function videoCommand(sock, chatId, msg) {
@@ -100,53 +105,48 @@ export async function videoCommand(sock, chatId, msg) {
     if (!fs.existsSync("tmp")) fs.mkdirSync("tmp");
 
     const safeTitle = video.title.replace(/[^\w\s]/gi, "").substring(0, 50);
-    inputPath = path.join("tmp", `${Date.now()}-${safeTitle}-input.mp4`);
+    const outputId = `${Date.now()}-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+    inputPath = path.join("tmp", `${outputId}-${safeTitle}-input.mp4`);
 
     await sock.sendMessage(chatId, {
       text: `🎬 Downloading video:\n*${video.title}*\n⏱️ Duration: ${video.duration?.timestamp || 'Unknown'}\n👀 Views: ${video.views?.toLocaleString() || 'Unknown'}\n\n⏳ Please wait...`
     }, { quoted: msg });
 
-    // Build API URL with the video URL
-    const encodedUrl = encodeURIComponent(video.url);
-    const apiUrl = `https://ef-prime-md-ultra-apis.vercel.app/downloader/ytdlv2?url=${encodedUrl}&format=video`;
+    let videoTitle = video.title;
+    await queueYouTubeDownload(async () => {
+      try {
+        const encodedUrl = encodeURIComponent(video.url);
+        const apiUrl = `https://ef-prime-md-ultra-apis.vercel.app/downloader/ytdlv2?url=${encodedUrl}&format=video`;
+        console.log("VIDEO: requesting download URL from provider");
 
-    console.log("🔗 Fetching video info from API:", apiUrl);
+        const apiResponse = await retryTransient(
+          () => axios.get(apiUrl, { timeout: 60000 }),
+          "VIDEO API"
+        );
+        const videoData = apiResponse.data?.answer;
+        const downloadUrl = videoData?.video_url ||
+          (videoData?.video_url_hd && videoData.video_url_hd !== "No SD video URL available"
+            ? videoData.video_url_hd
+            : null);
 
-    // Fetch video download URLs from API
-    const apiResponse = await axios.get(apiUrl, {
-      timeout: 60000 // 60 second timeout
+        if (!videoData?.status || !downloadUrl) {
+          throw new Error("Video API did not return a usable download URL.");
+        }
+
+        videoTitle = videoData.title || video.title;
+        await retryTransient(
+          () => downloadStreamToFile(downloadUrl, inputPath),
+          "VIDEO API media download"
+        );
+      } catch (apiErr) {
+        cleanup(inputPath);
+        console.error("VIDEO API failed, trying yt-dlp fallback:", apiErr?.code || apiErr?.message || apiErr);
+        await retryTransient(
+          () => downloadWithYtDlp(video.url, inputPath),
+          "VIDEO yt-dlp"
+        );
+      }
     });
-
-    if (!apiResponse.data?.answer?.status) {
-      return sock.sendMessage(chatId, {
-        text: "❌ Failed to fetch video download link."
-      }, { quoted: msg });
-    }
-
-    const videoData = apiResponse.data.answer;
-    
-    // Prefer the ready MP4 URL. Re-encoding video with ffmpeg is too heavy for
-    // small Railway instances and can crash the command.
-    const downloadUrl =
-      videoData.video_url ||
-      (videoData.video_url_hd !== "No SD video URL available" ? videoData.video_url_hd : null);
-
-    if (!downloadUrl) {
-      return sock.sendMessage(chatId, {
-        text: "❌ No video download URL available."
-      }, { quoted: msg });
-    }
-
-    console.log("⬇️ Downloading video from:", downloadUrl);
-
-    try {
-      await downloadStreamToFile(downloadUrl, inputPath);
-    } catch (downloadErr) {
-      cleanup(inputPath);
-      console.error("VIDEO API download failed, trying yt-dlp fallback:", downloadErr?.code || downloadErr?.message || downloadErr);
-      await downloadWithYtDlp(video.url, inputPath);
-    }
-
     const stats = fs.statSync(inputPath);
 
     // WhatsApp/Railway free-tier guard.
@@ -164,8 +164,8 @@ export async function videoCommand(sock, chatId, msg) {
     await sock.sendMessage(chatId, {
       document: fs.readFileSync(inputPath),
       mimetype: "video/mp4",
-      fileName: `${videoData.title || video.title}.mp4`,
-      caption: `🎬 ${videoData.title || video.title}`
+      fileName: `${videoTitle}.mp4`,
+      caption: `🎬 ${videoTitle}`
     }, { quoted: msg });
 
     cleanup(inputPath);
@@ -174,14 +174,17 @@ export async function videoCommand(sock, chatId, msg) {
     cleanup(inputPath);
     console.error("VIDEO ERROR:", e);
     
-    // Specific error messages
-    let errorMsg = "❌ Unexpected error occurred.";
-    if (e.code === 'ECONNABORTED' || e.code === 'ETIMEDOUT') {
+    const errorText = String(e?.message || e);
+    let errorMsg = "The video download failed. Please try again later.";
+    if (/not a bot|sign in to confirm/i.test(errorText)) {
+      errorMsg = "YouTube is blocking downloads from the bot server right now. Please try again later.";
+    } else if (/requested format is not available|only images are available/i.test(errorText)) {
+      errorMsg = "YouTube did not provide a downloadable video format for that result. Try another video.";
+    } else if (e.code === 'ECONNABORTED' || e.code === 'ETIMEDOUT') {
       errorMsg = "Download timeout. The video might be too large or the server is slow.";
     } else if (e.response?.status) {
-      errorMsg = `❌ API Error: ${e.response.status} - ${e.response.statusText}`;
+      errorMsg = `Video provider error: ${e.response.status} - ${e.response.statusText}`;
     }
-    
     await sock.sendMessage(chatId, {
       text: errorMsg
     }, { quoted: msg });
